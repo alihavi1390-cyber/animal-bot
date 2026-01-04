@@ -19,7 +19,7 @@ from telebot import apihelper, types
 import requests
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8365956718:AAEcJGYB8kI875BRaFRmW0x1WTmm_G3qTGE')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8365956718:AAEcJGYB################8kI875BRaFRmW0x1WTmm_G3qTGE')
 
 # OpenRouter Configuration
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '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')
