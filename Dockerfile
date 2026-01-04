@@ -1,4 +1,4 @@
-FROM python:3.11-slim  # تغییر به 3.11 برای سازگاری بهتر
+FROM python:3.10-slim
 
 WORKDIR /app
 
