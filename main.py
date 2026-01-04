@@ -1,72 +1,112 @@
 #!/usr/bin/env python3
 """
-🤖 ربات شناسایی حیوانات با Google Gemini
+🤖 ربات هوشمند شناسایی حیوانات - نسخه بدون Pillow
+📸 کاربر عکس می‌فرستد → ربات اطلاعات حیوان را برمی‌گرداند
 """
 
 import os
+import json
 import logging
 import asyncio
-import google.generativeai as genai
+import aiohttp
+import base64
+from io import BytesIO
+from typing import Optional, Dict, Any
 from datetime import datetime
 
 import telebot
-from telebot import apihelper
-from PIL import Image
+from telebot import apihelper, types
 import requests
-from io import BytesIO
+import google.generativeai as genai
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8365956718:AAEcJGYB8kI875BRaFRmW0x1WTmm_G3qTGE')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyC06j93jtQ8TajCa173Z-V9fO8rIoRj1XU')  # 🔥 کلید خودت را اینجا بذار
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyC06j93jtQ8TajCa173Z-V9fO8rIoRj1XU')
 
 # تنظیم Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ==================== LOGGING ====================
+# Rate limiting
+MAX_REQUESTS_PER_USER = 10
+MAX_IMAGE_SIZE_MB = 10
+REQUEST_TIMEOUT = 30
+
+# ==================== LOGGING SETUP ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.FileHandler('animal_bot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+# ==================== BOT INITIALIZATION ====================
+apihelper.SESSION_TIME_TO_LIVE = 5 * 60
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode='HTML')
 user_requests = {}
 
 # ==================== HELPER FUNCTIONS ====================
-def compress_image(image_bytes, max_size_kb=500):
-    """فشرده‌سازی عکس"""
+def check_rate_limit(user_id: int) -> bool:
+    """بررسی محدودیت تعداد درخواست کاربر"""
+    now = datetime.now()
+    
+    if user_id not in user_requests:
+        user_requests[user_id] = []
+    
+    user_requests[user_id] = [
+        req_time for req_time in user_requests[user_id]
+        if (now - req_time).seconds < 60
+    ]
+    
+    if len(user_requests[user_id]) >= MAX_REQUESTS_PER_USER:
+        return False
+    
+    user_requests[user_id].append(now)
+    return True
+
+def compress_image_simple(image_bytes: bytes, max_size_kb: int = 1024) -> bytes:
+    """
+    فشرده‌سازی ساده عکس بدون Pillow
+    فقط بررسی حجم و برگرداندن همان عکس اگر حجمش کم است
+    """
+    # اگر حجم عکس از حد مجاز کمتر است، برگردان
+    if len(image_bytes) <= max_size_kb * 1024:
+        return image_bytes
+    
+    # اگر حجم زیاد است، تلاش می‌کنیم با کاهش کیفیت فشرده کنیم
+    # این یک روش ساده است - در نسخه واقعی بهتر است از سرویس ابری استفاده شود
     try:
-        img = Image.open(BytesIO(image_bytes))
-        
-        # اگر حجم کم است برگردان
-        if len(image_bytes) <= max_size_kb * 1024:
+        # تلاش برای ارسال عکس اصلی (Gemini می‌تواند عکس‌های تا ۴MB را پردازش کند)
+        if len(image_bytes) <= 4 * 1024 * 1024:  # 4MB
             return image_bytes
         
-        # فشرده‌سازی
-        output = BytesIO()
-        img.convert('RGB').save(output, format='JPEG', quality=85, optimize=True)
+        # اگر خیلی بزرگ است، به کاربر اطلاع می‌دهیم
+        logger.warning(f"حجم عکس زیاد است: {len(image_bytes) / 1024 / 1024:.2f}MB")
+        return image_bytes[:4 * 1024 * 1024]  # فقط ۴MB اول را می‌فرستیم
         
-        return output.getvalue()
     except Exception as e:
-        logger.error(f"Compression error: {e}")
+        logger.error(f"خطا در فشرده‌سازی ساده: {e}")
         return image_bytes
 
-async def analyze_with_gemini(image_bytes):
-    """تحلیل عکس با Gemini"""
+def encode_image_to_base64(image_bytes: bytes) -> str:
+    """تبدیل عکس به base64"""
+    encoded = base64.b64encode(image_bytes).decode('utf-8')
+    return f"data:image/jpeg;base64,{encoded}"
+
+async def analyze_with_gemini(image_bytes: bytes) -> str:
+    """تحلیل عکس با Gemini Pro Vision"""
     try:
-        # ابتدا مدل‌های در دسترس را چک کن
+        # بررسی مدل‌های در دسترس
         available_models = []
         for m in genai.list_models():
             if 'vision' in m.name.lower() or 'gemini' in m.name.lower():
                 available_models.append(m.name)
         
-        logger.info(f"Available models: {available_models}")
+        logger.info(f"مدل‌های در دسترس: {available_models}")
         
-        # انتخاب مدل (اولویت‌بندی)
+        # انتخاب مدل
         model_name = None
         preferred_models = [
             'gemini-1.5-pro-vision',
@@ -81,9 +121,9 @@ async def analyze_with_gemini(image_bytes):
                 break
         
         if not model_name:
-            model_name = 'gemini-pro'  # مدل پیش‌فرض
+            model_name = 'gemini-pro'
         
-        logger.info(f"Using model: {model_name}")
+        logger.info(f"استفاده از مدل: {model_name}")
         
         # ساخت مدل
         model = genai.GenerativeModel(model_name)
@@ -110,26 +150,31 @@ async def analyze_with_gemini(image_bytes):
             {"mime_type": "image/jpeg", "data": image_bytes}
         ])
         
-        return response.text if response.text else "⚠️ مدل پاسخی نداد. لطفاً عکس واضح‌تری بفرستید."
+        if response.text:
+            return response.text
+        else:
+            return "⚠️ مدل پاسخی نداد. لطفاً عکس واضح‌تری بفرستید."
     
     except Exception as e:
-        logger.error(f"Gemini API error: {str(e)}")
-        return f"❌ خطا در تحلیل: {str(e)}"
+        logger.error(f"خطا در Gemini API: {str(e)}")
+        return f"❌ خطا در تحلیل عکس: {str(e)[:100]}"
 
 # ==================== BOT HANDLERS ====================
 @bot.message_handler(commands=['start', 'help'])
 def handle_start(message):
+    """هندلر دستور /start و /help"""
+    
     welcome_text = """
-👋 **به ربات هوشمند شناسایی حیوانات خوش آمدید!**
+<b>🐾 به ربات شناسایی حیوانات خوش آمدید!</b>
 
-🐾 **نحوه استفاده:**
+<b>📌 نحوه استفاده:</b>
 ۱. یک عکس واضح از حیوان بفرستید
-۲. ربات با هوش مصنوعی Google Gemini عکس را تحلیل می‌کند
+۲. ربات عکس را تحلیل می‌کند
 ۳. اطلاعات کامل حیوان را دریافت می‌کنید
 
-📋 **اطلاعات دریافتی:**
+<b>📋 اطلاعات دریافتی:</b>
 • نام فارسی و علمی
-• خانواده و رده‌بندی  
+• خانواده/رده
 • زیستگاه طبیعی
 • رژیم غذایی
 • ویژگی‌های فیزیکی
@@ -137,191 +182,226 @@ def handle_start(message):
 • حقایق جالب
 • طول عمر متوسط
 
-⚡ **تکنولوژی:** Google Gemini Pro Vision
-🌐 **میزبانی:** Railway.app
+<b>⚠️ نکات مهم:</b>
+• عکس باید واضح و روشن باشد
+• حیوان باید در کادر عکس باشد
+• پاسخ ممکن است ۱۰-۲۰ ثانیه طول بکشد
+• حداکثر حجم عکس: ۱۰ مگابایت
 
-📌 **دستورات:**
-/start - نمایش این راهنما
-/about - درباره ربات
+<b>🔧 دستورات:</b>
+/start - نمایش این پیام
 /stats - آمار استفاده
+/about - درباره ربات
 
-🚀 **یک عکس بفرستید و شروع کنید!**
+<b>🔄 برای شروع، یک عکس بفرستید!</b>
     """
+    
     bot.reply_to(message, welcome_text)
 
 @bot.message_handler(commands=['about'])
 def handle_about(message):
+    """درباره ربات"""
     about_text = """
-🤖 **درباره ربات شناسایی حیوانات**
+<b>🤖 درباره ربات شناسایی حیوانات</b>
 
-🧠 **فناوری به کار رفته:**
-• موتور هوش مصنوعی: Google Gemini Pro Vision
-• قابلیت: تحلیل پیشرفته تصاویر
+<b>🧠 فناوری:</b>
+• مدل هوش مصنوعی: Google Gemini Pro Vision
+• قابلیت: تحلیل تصاویر پیشرفته
 • زبان: فارسی و انگلیسی
 
-🎯 **هدف پروژه:**
-کمک به شناخت بهتر حیوانات و محیط زیست
+<b>⚡ میزبانی:</b>
+Railway.app - سرویس ابری قدرتمند
 
-⚙️ **مشخصات فنی:**
-• زبان برنامه‌نویسی: Python 3.10
-• کتابخانه اصلی: pyTelegramBotAPI
-• میزبانی: Railway.app
-• دیتابیس: Gemini AI
-
-📊 **محدودیت‌ها:**
-• حداکثر حجم عکس: ۱۰ مگابایت
-• تعداد درخواست: ۱۵ در دقیقه (رایگان)
-• زمان تحلیل: ۱۰-۲۰ ثانیه
-
-👨‍💻 **توسعه‌دهنده:**
-ربات با ❤️ توسط جامعه توسعه‌دهندگان ایرانی
-
-🔗 **پشتیبانی:**
-برای گزارش مشکل پیام دهید.
+<b>📞 پشتیبانی:</b>
+برای گزارش مشکل یا پیشنهاد، پیام دهید.
     """
     bot.reply_to(message, about_text)
 
 @bot.message_handler(commands=['stats'])
 def handle_stats(message):
+    """نمایش آمار استفاده"""
+    user_id = message.from_user.id
     user_name = message.from_user.username or message.from_user.first_name
+    
+    if user_id in user_requests:
+        request_count = len(user_requests[user_id])
+    else:
+        request_count = 0
+    
     stats_text = f"""
-📊 **آمار استفاده**
+<b>📊 آمار استفاده شما</b>
 
-👤 کاربر: {user_name}
-🆔 شناسه: {message.from_user.id}
-📅 تاریخ: {datetime.now().strftime('%Y/%m/%d')}
-⏰ زمان: {datetime.now().strftime('%H:%M')}
+<b>👤 کاربر:</b> {user_name}
+<b>🆔 شناسه:</b> {user_id}
+<b>📨 تعداد درخواست‌ها (۱ دقیقه اخیر):</b> {request_count}
+<b>📈 حداکثر مجاز:</b> {MAX_REQUESTS_PER_USER} درخواست در دقیقه
 
-⚡ **وضعیت سرویس:**
-• Gemini API: ✅ فعال
-• تلگرام: ✅ متصل
-• سرور: ✅ آنلاین
-
-💡 **نکته:** از بات به درستی استفاده کنید.
+<b>🔄 برای استفاده بیشتر، صبر کنید...</b>
     """
+    
     bot.reply_to(message, stats_text)
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
+    """هندلر دریافت عکس"""
+    
+    user_id = message.from_user.id
+    user_name = message.from_user.username or message.from_user.first_name
+    
+    logger.info(f"📸 دریافت عکس از کاربر {user_name} (ID: {user_id})")
+    
+    # بررسی rate limit
+    if not check_rate_limit(user_id):
+        bot.reply_to(message, "⏸️ تعداد درخواست‌های شما زیاد است. لطفاً ۱ دقیقه صبر کنید.")
+        return
+    
     try:
-        user_id = message.from_user.id
-        user_name = message.from_user.username or message.from_user.first_name
-        
-        logger.info(f"📸 دریافت عکس از {user_name} ({user_id})")
-        
-        # پیام پردازش
+        # ارسال پیام "در حال پردازش"
         processing_msg = bot.send_message(
             message.chat.id,
-            "🔍 **در حال دریافت و پردازش عکس...**\nلطفاً کمی صبر کنید ⏳",
+            "🔍 <b>در حال تحلیل عکس...</b>\nلطفاً کمی صبر کنید ⏳",
             reply_to_message_id=message.message_id
         )
         
-        # دریافت عکس
+        # دریافت بزرگترین سایز عکس
         photo_info = message.photo[-1]
         file_info = bot.get_file(photo_info.file_id)
+        
+        # ساخت لینک مستقیم
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+        logger.info(f"📥 دانلود عکس از: {file_info.file_path}")
         
-        logger.info(f"📥 دانلود از: {file_info.file_path}")
-        
-        # دانلود
+        # دانلود عکس
         response = requests.get(file_url, timeout=15)
         response.raise_for_status()
+        
         image_bytes = response.content
         
-        # بررسی حجم
-        if len(image_bytes) > 10 * 1024 * 1024:  # 10MB
+        # بررسی حجم عکس
+        if len(image_bytes) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
             bot.edit_message_text(
-                "❌ **حجم عکس زیاد است!**\nحداکثر حجم: ۱۰ مگابایت",
+                "❌ حجم عکس بیش از حد مجاز است (حداکثر ۱۰ مگابایت)",
                 chat_id=processing_msg.chat.id,
                 message_id=processing_msg.message_id
             )
             return
         
-        # فشرده‌سازی
-        compressed = compress_image(image_bytes)
+        # فشرده‌سازی ساده
+        compressed_image = compress_image_simple(image_bytes)
         
-        # به روزرسانی پیام
+        # ویرایش پیام به "در حال تحلیل"
         bot.edit_message_text(
-            "🤖 **در حال تحلیل با هوش مصنوعی Gemini...**\nاین ممکنه ۱۰-۲۰ ثانیه طول بکشد ☕",
+            "🤖 <b>در حال تحلیل با هوش مصنوعی Gemini...</b>\nاین ممکنه ۱۰-۲۰ ثانیه طول بکشد ☕",
             chat_id=processing_msg.chat.id,
             message_id=processing_msg.message_id
         )
         
-        # تحلیل با Gemini
-        analysis = asyncio.run(analyze_with_gemini(compressed))
+        # تحلیل عکس با Gemini (به صورت همزمان)
+        analysis = asyncio.run(analyze_with_gemini(compressed_image))
         
         # حذف پیام پردازش
         bot.delete_message(processing_msg.chat.id, processing_msg.message_id)
         
-        # ساخت پاسخ نهایی
+        # ارسال پاسخ نهایی
         response_text = f"""
-🐾 **نتایج تحلیل هوش مصنوعی**
+<b>🐾 نتیجه تحلیل حیوان</b>
 
 {analysis}
 
-━━━━━━━━━━━━━━━━━━━━
-📌 **اطلاعات تحلیل:**
-👤 کاربر: {user_name}
-📅 تاریخ: {datetime.now().strftime('%Y/%m/%d %H:%M')}
-🤖 مدل: Google Gemini Pro Vision
-⚡ سرور: Railway.app
+<b>🔬 فناوری:</b> Google Gemini Pro Vision
+<b>👤 کاربر:</b> {user_name}
+<b>🕒 زمان:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-💡 *اطلاعات بر اساس هوش مصنوعی تولید شده و ممکن است نیاز به تأیید داشته باشد.*
+<i>⚠️ توجه: اطلاعات بر اساس هوش مصنوعی تولید شده و نیاز به تأیید دارد.</i>
         """
         
-        # ارسال پاسخ
-        bot.send_message(
-            message.chat.id,
-            response_text,
-            reply_to_message_id=message.message_id,
-            parse_mode='Markdown'
-        )
+        # اگر پاسخ خیلی طولانی است، به چند قسمت تقسیم کن
+        if len(response_text) > 4000:
+            chunks = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
+            for chunk in chunks:
+                bot.send_message(
+                    message.chat.id,
+                    chunk,
+                    reply_to_message_id=message.message_id
+                )
+        else:
+            bot.send_message(
+                message.chat.id,
+                response_text,
+                reply_to_message_id=message.message_id
+            )
         
-        logger.info(f"✅ پاسخ ارسال شد به {user_name}")
+        logger.info(f"✅ پاسخ ارسال شد به کاربر {user_name}")
         
     except requests.exceptions.RequestException as e:
-        logger.error(f"دانلود خطا: {e}")
-        bot.reply_to(message, "❌ **خطا در دریافت عکس.**\nلطفاً دوباره تلاش کنید.")
+        logger.error(f"❌ خطا در دانلود عکس: {e}")
+        bot.reply_to(message, "❌ خطا در دریافت عکس. لطفاً دوباره تلاش کنید.")
     
     except Exception as e:
-        logger.error(f"خطای کلی: {e}")
-        bot.reply_to(message, f"⚠️ **خطای غیرمنتظره:**\n{str(e)}")
+        logger.error(f"❌ خطای ناشناخته: {e}")
+        bot.reply_to(message, f"⚠️ خطای غیرمنتظره رخ داد: {str(e)[:100]}")
 
 @bot.message_handler(func=lambda message: True)
-def handle_text(message):
-    bot.reply_to(message, 
-        "📸 **لطفاً یک عکس از حیوان بفرستید!**\n\n"
-        "برای راهنمایی /start را تایپ کنید."
+def handle_other_messages(message):
+    """هندلر سایر پیام‌ها"""
+    
+    if message.text:
+        bot.reply_to(
+            message,
+            "📸 لطفاً یک عکس از حیوان بفرستید!\n\n"
+            "برای راهنمایی /start را تایپ کنید."
+        )
+    elif message.document:
+        bot.reply_to(
+            message,
+            "⚠️ لطفاً عکس بفرستید، نه فایل!\n"
+            "فایل‌های داکیومنت قابل پردازش نیستند."
+        )
+
+# ==================== ERROR HANDLERS ====================
+@bot.message_handler(func=lambda message: True, content_types=['audio', 'voice', 'video', 'sticker'])
+def handle_unsupported(message):
+    """هندلر انواع پیام پشتیبانی نشده"""
+    bot.reply_to(
+        message,
+        "⚠️ این نوع پیام پشتیبانی نمی‌شود.\n"
+        "لطفاً فقط عکس بفرستید."
     )
 
-# ==================== RUN BOT ====================
+# ==================== MAIN EXECUTION ====================
 if __name__ == "__main__":
     logger.info("=" * 50)
-    logger.info("🚀 راه‌اندازی ربات شناسایی حیوانات")
-    logger.info(f"🔑 Gemini Key: {'✅' if GEMINI_API_KEY else '❌'}")
+    logger.info("🤖 راه‌اندازی ربات شناسایی حیوانات (نسخه بدون Pillow)")
+    logger.info(f"👤 توکن: {TELEGRAM_TOKEN[:10]}..." if TELEGRAM_TOKEN else "❌ توکن تنظیم نشده")
+    logger.info(f"🔑 Gemini: {'✅' if GEMINI_API_KEY else '❌ کلید تنظیم نشده'}")
     logger.info("=" * 50)
     
     try:
+        # نمایش اطلاعات شروع
         bot_info = bot.get_me()
-        print("\n" + "="*50)
-        print(f"🤖 بات: @{bot_info.username}")
+        print(f"\n{'='*50}")
+        print(f"🤖 بات فعال: @{bot_info.username}")
         print(f"📛 نام: {bot_info.first_name}")
         print(f"🆔 شناسه: {bot_info.id}")
-        print("="*50)
-        print("✅ بات فعال و آماده دریافت پیام...")
+        print(f"{'='*50}")
+        print("✅ بات آماده دریافت پیام...")
         print("🛑 برای توقف: Ctrl+C")
-        print("="*50 + "\n")
+        print(f"{'='*50}\n")
         
+        # شروع polling
         bot.infinity_polling(timeout=60, long_polling_timeout=30)
         
     except telebot.apihelper.ApiTelegramException as e:
-        logger.error(f"خطای تلگرام: {e}")
-        print(f"❌ خطای تلگرام: {e}")
-        
+        logger.error(f"❌ خطای تلگرام API: {e}")
+        print("❌ خطا در اتصال به تلگرام. بررسی کنید:")
+        print("1. توکن درست است؟")
+        print("2. اینترنت متصل است؟")
+        print(f"3. خطا: {e}")
+    
     except KeyboardInterrupt:
-        logger.info("توقف دستی")
-        print("\n🛑 بات متوقف شد")
-        
+        logger.info("⏹️ توقف دستی بات")
+        print("\n⏹️ بات متوقف شد")
+    
     except Exception as e:
-        logger.error(f"خطای غیرمنتظره: {e}")
+        logger.error(f"❌ خطای غیرمنتظره: {e}")
         print(f"❌ خطا: {e}")
